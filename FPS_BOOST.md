@@ -1,27 +1,49 @@
-# Chimera FPS Boost
+# Chimera Potato (improved FPS mode)
 
-Target: Halo Custom Edition 1.10, Chimera600-derived fork.
+Target: Halo Custom Edition 1.10 – Chimera600-derived fork.
+
+This is a modern, safer recreation of the old `chimera_potato` feature that existed in early Chimera builds.  
+It is designed to give the largest possible FPS increase on low-end / “potato” PCs while **never touching Active Camo**.
 
 ## Commands
 
 ```text
-chimera_fps_boost 0
-chimera_fps_boost 1
-chimera_fps_boost 2
-chimera_fps_boost 3
+chimera_potato [off/low/medium/high/ultra]
+chimera_potato [0-4]
+
+chimera_fps_boost [same arguments]     # alias
 ```
 
-## Profiles
+## Levels
 
-- **1:** AF off, firing particles off, optional normal zoom blur and multitexture overlays off.
-- **2:** level 1 + BSP detail/bump maps removed and shader lightmap detail forced to the lowest level.
-- **3:** level 2 + BSP base maps removed and water maps/brightness removed.
+| Level   | Name    | What it does                                                                 | Camo safe? |
+|---------|---------|------------------------------------------------------------------------------|------------|
+| 0       | off     | Restores all visual changes                                                  | Yes        |
+| 1       | low     | AF off + firing particles off + multitexture overlays off                    | Yes        |
+| 2       | medium  | low + strip BSP detail/bump maps + force lowest lightmap detail              | Yes        |
+| 3       | high    | medium + strip BSP base maps + remove water textures/brightness              | Yes        |
+| 4       | ultra   | high + extra model detail stripping (player/weapon **base** maps kept)       | Yes        |
 
-The module does not touch transparent shader tags or the alpha render target, preserving Active Camo.
-Player/weapon shader model base maps remain intact.
+### What is **never** touched
+- Any transparent shader tag (chicago, chicago_extended, etc.)
+- The alpha render target (required for Active Camo distortion)
+- Player / weapon base maps (so characters stay recognizable)
+- Gameplay, magnetism, hit registration, object tables, interpolation
 
-The tag dependency patches are stored and restored when switching back to level 0 or another profile on the same map. On a map change, old patch addresses are discarded and the active profile is applied to the new tag array.
+Only visual tag dependencies are modified, and they are fully restored when you go back to `off` or change map.
+
+## Recommended usage for maximum FPS
+
+```text
+chimera_potato ultra
+chimera_interpolate off          # or low
+chimera_af false
+chimera_block_firing_particles true
+# + lower resolution (e.g. 1024x768 or 800x600)
+```
+
+On very weak GPUs (old integrated graphics, low VRAM cards) the combination of `ultra` + low resolution + interpolation off can easily give 2×–3× FPS or more compared with stock Chimera settings.
 
 ## Build
 
-Run `build.bat` from the project root with the same MinGW32 environment used by the rest of Chimera600. The batch file now compiles `client/enhancements/fps_boost.cpp` and includes it in the wildcard link step.
+Just run `build.bat` as usual. The potato module is already included in the link step.

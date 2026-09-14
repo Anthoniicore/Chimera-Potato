@@ -3,15 +3,21 @@
 #include "../command/command.h"
 
 /// Initializes optional renderer signatures and the map-load hook used by the
-/// FPS profiles.
+/// potato / FPS profiles.
 void initialize_fps_boost() noexcept;
 
-/// FPS profiles:
-///   0 = off
-///   1 = safe: AF off + firing particles off + multitexture overlays off; normal zoom blur is preserved
-///   2 = aggressive: level 1 + strip BSP detail/bump textures + lowest lightmap detail
-///   3 = ultra: level 2 + strip BSP base textures + remove water textures/brightness
+/// Chimera Potato (improved, camo-safe)
 ///
-/// Active Camo is protected: transparent shader classes and the alpha render
-/// target are never modified by this module.
+/// Levels (both numeric and classic names accepted):
+///   0 / off      - Restore everything
+///   1 / low      - AF off + firing particles off + multitexture overlays off
+///   2 / medium   - low + strip BSP detail/bump maps + lowest lightmap detail
+///   3 / high    - medium + strip BSP base maps + remove water
+///   4 / ultra    - high + extra model detail stripping (still keeps player/weapon base maps)
+///
+/// CRITICAL: Never touches transparent shader tags (chicago / chicago_extended),
+/// nor the alpha render target. Active Camo stays fully functional.
 ChimeraCommandError fps_boost_command(size_t argc, const char **argv) noexcept;
+
+/// Alias for the classic name people remember.
+ChimeraCommandError potato_command(size_t argc, const char **argv) noexcept;
