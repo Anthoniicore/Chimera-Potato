@@ -1,0 +1,57 @@
+name: Build Chimera-Potato
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build 32-bit Release DLL
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 MinGW32
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          install: >-
+            mingw-w64-i686-gcc
+            mingw-w64-i686-binutils
+
+      - name: Check toolchain
+        shell: msys2 {0}
+        run: |
+          gcc --version
+          g++ --version
+          windres --version
+          ar --version
+
+      - name: Build Chimera-Potato
+        shell: msys2 {0}
+        run: |
+          # Feed a key so the final "pause" in build.bat does not hang CI
+          printf 'x\n' | cmd.exe //D //C call build.bat release
+
+      - name: Verify DLL
+        shell: msys2 {0}
+        run: |
+          test -f bin/chimera.dll
+          file bin/chimera.dll
+          ls -la bin/chimera.dll
+
+      - name: Upload chimera.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: Chimera-Potato-${{ github.sha }}
+          path: bin/chimera.dll
+          if-no-files-found: error
+          retention-days: 30
