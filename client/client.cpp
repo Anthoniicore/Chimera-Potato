@@ -317,16 +317,27 @@ void initialize_client() noexcept {
         "  - chimera_af [true/false]"
     , 0, 1, find_anisotropic_filtering_signature(), true);
 
-    (*commands).emplace_back("chimera_fps_boost", fps_boost_command, "visuals",
-        "Apply an aggressive client-side FPS optimization profile. This does not modify gameplay, "
-        "hit registration, magnetism, interpolation, or Active Camo rendering.\n\n"
+    // Chimera Potato (main command) – improved, camo-safe FPS mode
+    (*commands).emplace_back("chimera_potato", potato_command, "visuals",
+        "Aggressive client-side FPS optimization (Chimera Potato mode).\n"
+        "Designed for low-end PCs. Never touches Active Camo or transparent shaders.\n\n"
         "Levels:\n"
-        "  0: Off.\n"
-        "  1: AF off + firing particles, zoom blur and multitexture overlays disabled.\n"
-        "  2: Level 1 + strip BSP detail/bump textures and use the lowest lightmap detail.\n"
-        "  3: Level 2 + strip BSP base textures and remove water textures.\n\n"
+        "  off / 0     - Restore everything\n"
+        "  low / 1     - AF off + firing particles + multitexture overlays off\n"
+        "  medium / 2  - low + strip BSP detail/bump + lowest lightmap detail\n"
+        "  high / 3    - medium + strip BSP base maps + remove water\n"
+        "  ultra / 4   - high + extra model detail stripping (player/weapon base maps kept)\n\n"
         "Syntax:\n"
-        "  - chimera_fps_boost [0-3]"
+        "  - chimera_potato [off/low/medium/high/ultra]\n"
+        "  - chimera_potato [0-4]"
+    , 0, 1, true, true);
+
+    // Alias for convenience
+    (*commands).emplace_back("chimera_fps_boost", fps_boost_command, "visuals",
+        "Alias of chimera_potato. Same levels and same camo-safe behaviour.\n\n"
+        "Syntax:\n"
+        "  - chimera_fps_boost [off/low/medium/high/ultra]\n"
+        "  - chimera_fps_boost [0-4]"
     , 0, 1, true, true);
 
     (*commands).emplace_back("chimera_block_firing_particles", block_firing_particles_command, "visuals",
