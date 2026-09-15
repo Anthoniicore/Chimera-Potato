@@ -20,8 +20,21 @@
 #include "../visuals/anisotropic_filtering.h"
 
 // =============================================================================
-// Chimera Potato – lower detail WITHOUT deleting living objects
-// + optional instant corpse cleanup for FPS
+// Chimera Potato – recreate original 2018 behaviour (camo-safe)
+// =============================================================================
+// Original: "Wreck Halo's graphics, increasing FPS"
+//   low/medium/high/ultra – models and objects STAY VISIBLE
+//   high may "break" some things; ultra = full potato look
+//
+// Camo rule (strict):
+//   NEVER touch shader_transparent_chicago / chicago_extended / plasma
+//   NEVER disable alpha render target
+//   Enemy Active Camo must remain visible
+//
+// Visibility rule:
+//   NEVER delete living models / scenery / trees / rocks
+//   NEVER strip bump on alpha-tested shaders (foliage)
+//   ALWAYS keep shader_model base maps (armor / weapons stay colored)
 // =============================================================================
 
 namespace {
@@ -29,7 +42,8 @@ namespace {
 
     constexpr size_t SHADER_DETAIL_LEVEL_OFFSET = 0x02;
 
-    constexpr size_t SENV_FLAGS_OFFSET            = 0x28;
+    // shader_environment
+    constexpr size_t SENV_FLAGS_OFFSET            = 0x28; // bit0 = alpha tested
     constexpr size_t SENV_BASE_MAP_OFFSET         = 0x88;
     constexpr size_t SENV_PRIMARY_DETAIL_OFFSET   = 0xB8;
     constexpr size_t SENV_SECONDARY_DETAIL_OFFSET = 0xCC;
@@ -40,12 +54,14 @@ namespace {
     constexpr size_t SENV_PARA_BRIGHTNESS_OFFSET  = 0x31C;
     constexpr size_t SENV_REFLECTION_CUBE_OFFSET  = 0x340;
 
+    // shader_model – KEEP base map
     constexpr size_t SOSO_MULTIPURPOSE_MAP_OFFSET = 0xCC;
     constexpr size_t SOSO_DETAIL_MAP_OFFSET       = 0xEC;
     constexpr size_t SOSO_PERP_BRIGHTNESS_OFFSET  = 0x18C;
     constexpr size_t SOSO_PARA_BRIGHTNESS_OFFSET  = 0x19C;
     constexpr size_t SOSO_REFLECTION_CUBE_OFFSET  = 0x1AC;
 
+    // water / glass
     constexpr size_t SWAT_BASE_MAP_OFFSET                 = 0x4C;
     constexpr size_t SWAT_REFLECTION_MAP_OFFSET           = 0x7C;
     constexpr size_t SWAT_RIPPLE_MAP_OFFSET               = 0x9C;
@@ -57,24 +73,24 @@ namespace {
     constexpr size_t SGLA_PERP_BRIGHTNESS_OFFSET  = 0x50;
     constexpr size_t SGLA_PARA_BRIGHTNESS_OFFSET  = 0x60;
 
+    // Mild LOD preference (never hides models)
     constexpr size_t GBX_SUPER_HIGH_CUTOFF = 0x08;
     constexpr size_t GBX_HIGH_CUTOFF       = 0x0C;
     constexpr size_t GBX_MEDIUM_CUTOFF     = 0x10;
     constexpr size_t GBX_LOW_CUTOFF        = 0x14;
 
-    // Halo object_type: 0 = biped
+    constexpr size_t SKY_MODEL_OFFSET = 0x00;
+
     constexpr uint16_t OBJECT_TYPE_BIPED = 0;
 
     struct DependencyPatch {
         uint32_t *datum;
         uint32_t old_value;
     };
-
     struct U16Patch {
         uint16_t *value;
         uint16_t old_value;
     };
-
     struct FloatPatch {
         float *value;
         float old_value;
@@ -100,7 +116,7 @@ namespace {
         auto *value = reinterpret_cast<uint16_t *>(tag_data + SHADER_DETAIL_LEVEL_OFFSET);
         if (*value == 3) return;
         u16_patches.push_back({value, *value});
-        *value = 3;
+        *value = 3; // turd
     }
 
     void patch_float(char *tag_data, size_t offset, float new_value) noexcept {
@@ -116,8 +132,7 @@ namespace {
     }
 
     bool is_alpha_tested_senv(char *tag_data) noexcept {
-        auto flags = *reinterpret_cast<uint16_t *>(tag_data + SENV_FLAGS_OFFSET);
-        return (flags & 0x1) != 0;
+        return (*reinterpret_cast<uint16_t *>(tag_data + SENV_FLAGS_OFFSET) & 0x1) != 0;
     }
 
     void prefer_lower_model_lod(char *tag_data, int level) noexcept {
@@ -148,7 +163,6 @@ namespace {
             *it->value = it->old_value;
         for (auto it = float_patches.rbegin(); it != float_patches.rend(); ++it)
             *it->value = it->old_value;
-
         dependency_patches.clear();
         u16_patches.clear();
         float_patches.clear();
@@ -159,13 +173,13 @@ namespace {
 
         auto *tags = *reinterpret_cast<HaloTag **>(0x40440000);
         auto count = *reinterpret_cast<uint32_t *>(0x4044000C);
-
         if (!tags || count == 0 || count > 65535) return;
 
         for (uint32_t i = 0; i < count; ++i) {
             auto &tag = tags[i];
             if (!tag.data) continue;
 
+            // -------- CAMO SAFE: never enter chicago / plasma branches --------
             switch (tag.tag_class) {
                 case HaloCE::TAG_CLASS_INT_SHADER_ENVIRONMENT: {
                     const bool alpha_tested = is_alpha_tested_senv(tag.data);
@@ -175,14 +189,14 @@ namespace {
                     patch_dependency(tag.data, SENV_SECONDARY_DETAIL_OFFSET);
                     patch_dependency(tag.data, SENV_MICRO_DETAIL_OFFSET);
 
-                    if (!alpha_tested) {
+                    // Bump only on solid terrain (keeps trees/foliage)
+                    if (!alpha_tested)
                         patch_dependency(tag.data, SENV_BUMP_MAP_OFFSET);
-                    }
 
                     if (level >= 3) {
-                        if (!alpha_tested) {
+                        if (!alpha_tested)
                             patch_dependency(tag.data, SENV_BASE_MAP_OFFSET);
-                        }
+                        // Kill mirrors / reflections (not used by camo)
                         patch_u16_flags(tag.data, SENV_REFLECTION_FLAGS_OFFSET, 0x1);
                         patch_float(tag.data, SENV_PERP_BRIGHTNESS_OFFSET, 0.0f);
                         patch_float(tag.data, SENV_PARA_BRIGHTNESS_OFFSET, 0.0f);
@@ -192,6 +206,8 @@ namespace {
                 }
 
                 case HaloCE::TAG_CLASS_INT_SHADER_MODEL:
+                    // Characters / weapons / vehicles / scenery props
+                    // KEEP base map → always visible + colored (like original potato)
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SOSO_DETAIL_MAP_OFFSET);
                     patch_dependency(tag.data, SOSO_MULTIPURPOSE_MAP_OFFSET);
@@ -223,29 +239,38 @@ namespace {
                     }
                     break;
 
+                case HaloCE::TAG_CLASS_INT_SKY:
+                    // Original ultra flattened outdoor cost; sky model off only on ultra
+                    if (level >= 4)
+                        patch_dependency(tag.data, SKY_MODEL_OFFSET);
+                    break;
+
+                // Explicitly listed so it's obvious we skip them:
+                case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_CHICAGO:
+                case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_CHICAGO_EXTENDED:
+                case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_PLASMA:
+                case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_GENERIC:
+                    // Active Camo + energy shields – DO NOT TOUCH
+                    break;
+
                 default:
                     break;
             }
         }
     }
 
-    // Instantly remove dead bipeds (corpses) to free object slots and FPS
     void cleanup_dead_corpses() noexcept {
         if (!corpse_cleanup_enabled) return;
 
         auto &ot = get_object_table();
         if (!ot.first || ot.size == 0 || ot.max_count == 0) return;
 
-        // Collect IDs first so we don't invalidate the table while iterating
         std::vector<uint32_t> to_delete;
         to_delete.reserve(16);
 
         auto *entries = reinterpret_cast<char *>(ot.first);
-        const uint16_t count = ot.size;
-        const uint16_t index_size = ot.index_size;
-
-        for (uint16_t i = 0; i < count && i < ot.max_count; ++i) {
-            char *entry = entries + static_cast<size_t>(i) * index_size;
+        for (uint16_t i = 0; i < ot.size && i < ot.max_count; ++i) {
+            char *entry = entries + static_cast<size_t>(i) * ot.index_size;
             uint16_t salt = *reinterpret_cast<uint16_t *>(entry);
             if (salt == 0xFFFF) continue;
 
@@ -254,17 +279,13 @@ namespace {
 
             auto *base = reinterpret_cast<BaseHaloObject *>(obj);
             if (base->object_type != OBJECT_TYPE_BIPED) continue;
-
-            // Dead = no health left
             if (base->health > 0.0f) continue;
 
-            uint32_t full_id = (static_cast<uint32_t>(salt) << 16) | i;
-            to_delete.push_back(full_id);
+            to_delete.push_back((static_cast<uint32_t>(salt) << 16) | i);
         }
 
-        for (uint32_t id : to_delete) {
+        for (uint32_t id : to_delete)
             delete_object(id);
-        }
     }
 
     void on_tick() noexcept {
@@ -302,7 +323,6 @@ namespace {
 
     int parse_level(const char *arg) noexcept {
         if (!arg) return -1;
-
         char *end = nullptr;
         long n = strtol(arg, &end, 10);
         if (end != arg && *end == '\0' && n >= 0 && n <= 4)
@@ -340,13 +360,10 @@ namespace {
             set_zoom_blur(false);
             const char *arg[] = {"true"};
             block_firing_particles_command(1, arg);
-
             restore_tag_patches();
             apply_tag_profile(level);
-            // Corpses vanish instantly on any potato level > 0
             corpse_cleanup_enabled = true;
         }
-
         active_level = level;
     }
 
@@ -382,8 +399,8 @@ static ChimeraCommandError potato_impl(size_t argc, const char **argv) noexcept 
         apply_level(level);
     }
 
-    char current[48] = {};
-    sprintf(current, "%s (%d)  corpses=%s",
+    char current[64] = {};
+    sprintf(current, "%s (%d) | camo=safe | corpses=%s",
             level_name(active_level), active_level,
             corpse_cleanup_enabled ? "instant" : "normal");
     console_out(current);
