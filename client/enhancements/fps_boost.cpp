@@ -17,62 +17,63 @@
 #include "../visuals/anisotropic_filtering.h"
 
 // =============================================================================
-// Chimera Potato (aggressive, camo-safe)
+// Chimera Potato – match classic potato look from your screenshots
 // =============================================================================
-// Goal: maximum FPS on potato hardware while NEVER breaking Active Camo.
-//
-// Rules:
-//   1. NEVER touch transparent chicago / chicago_extended / plasma tags.
-//   2. NEVER disable the alpha render target.
-//   3. Glass reflections/mirrors and sky CAN be killed (not used by camo).
-//   4. On ultra we intentionally flatten model/weapon/scenery textures.
+// - Environment (BSP): strip textures hard → flat / white ground
+// - Models (characters, weapons, warthog, scenery): KEEP base color maps
+//   but force SUPER-LOW geometry LOD (the "model details" effect)
+// - Mirrors / sky / water killed on high+
+// - Active Camo never touched (no chicago / plasma / alpha RT)
 // =============================================================================
 
 namespace {
     constexpr uint32_t NULL_TAG_ID = 0xFFFFFFFFu;
 
-    // Common shader header
     constexpr size_t SHADER_DETAIL_LEVEL_OFFSET = 0x02;
 
-    // shader_environment (senv) – runtime offsets used by this fork
+    // shader_environment
     constexpr size_t SENV_BASE_MAP_OFFSET         = 0x88;
     constexpr size_t SENV_PRIMARY_DETAIL_OFFSET   = 0xB8;
     constexpr size_t SENV_SECONDARY_DETAIL_OFFSET = 0xCC;
     constexpr size_t SENV_MICRO_DETAIL_OFFSET     = 0xFC;
     constexpr size_t SENV_BUMP_MAP_OFFSET         = 0x128;
-    // Reflection section (cube map + brightness) – kills dynamic mirrors
     constexpr size_t SENV_REFLECTION_FLAGS_OFFSET = 0x2F4;
     constexpr size_t SENV_PERP_BRIGHTNESS_OFFSET  = 0x318;
     constexpr size_t SENV_PARA_BRIGHTNESS_OFFSET  = 0x31C;
     constexpr size_t SENV_REFLECTION_CUBE_OFFSET  = 0x340;
 
-    // shader_model (soso) – characters, weapons, trees, rocks, scenery
-    // Detail map offset was already verified in this tree (0xEC).
-    // Base / multipurpose derived relative to that known anchor.
-    constexpr size_t SOSO_BASE_MAP_OFFSET         = 0xB4;
+    // shader_model – keep BASE map (armor/weapon color), strip the rest
     constexpr size_t SOSO_MULTIPURPOSE_MAP_OFFSET = 0xCC;
     constexpr size_t SOSO_DETAIL_MAP_OFFSET       = 0xEC;
     constexpr size_t SOSO_PERP_BRIGHTNESS_OFFSET  = 0x18C;
     constexpr size_t SOSO_PARA_BRIGHTNESS_OFFSET  = 0x19C;
     constexpr size_t SOSO_REFLECTION_CUBE_OFFSET  = 0x1AC;
 
-    // shader_transparent_water (swat)
+    // water / glass / sky
     constexpr size_t SWAT_BASE_MAP_OFFSET                 = 0x4C;
     constexpr size_t SWAT_REFLECTION_MAP_OFFSET           = 0x7C;
     constexpr size_t SWAT_RIPPLE_MAP_OFFSET               = 0x9C;
     constexpr size_t SWAT_PERPENDICULAR_BRIGHTNESS_OFFSET = 0x5C;
     constexpr size_t SWAT_PARALLEL_BRIGHTNESS_OFFSET      = 0x6C;
 
-    // shader_transparent_glass (sgla) – mirrors / windows (NOT active camo)
     constexpr size_t SGLA_REFLECTION_MAP_OFFSET  = 0x70;
     constexpr size_t SGLA_BUMP_MAP_OFFSET         = 0x88;
-    constexpr size_t SGLA_DIFFUSE_MAP_OFFSET      = 0xA0;
     constexpr size_t SGLA_DIFFUSE_DETAIL_OFFSET   = 0xB8;
     constexpr size_t SGLA_PERP_BRIGHTNESS_OFFSET  = 0x50;
     constexpr size_t SGLA_PARA_BRIGHTNESS_OFFSET  = 0x60;
 
-    // sky tag – model reference is the expensive draw
     constexpr size_t SKY_MODEL_OFFSET = 0x00;
+
+    // gbxmodel LOD cutoffs (floats, pixels of bounding sphere)
+    // Layout from invader: after flags(4) + checksum(4)
+    constexpr size_t GBX_SUPER_HIGH_CUTOFF = 0x08;
+    constexpr size_t GBX_HIGH_CUTOFF       = 0x0C;
+    constexpr size_t GBX_MEDIUM_CUTOFF     = 0x10;
+    constexpr size_t GBX_LOW_CUTOFF        = 0x14;
+    constexpr size_t GBX_SUPER_LOW_CUTOFF  = 0x18;
+
+    // Force higher LODs to require an impossible on-screen size → always super-low
+    constexpr float LOD_FORCE_SUPER_LOW = 999999.0f;
 
     struct DependencyPatch {
         uint32_t *datum;
@@ -90,8 +91,8 @@ namespace {
     };
 
     std::vector<DependencyPatch> dependency_patches;
-    std::vector<U16Patch> detail_level_patches;
-    std::vector<FloatPatch> water_float_patches;
+    std::vector<U16Patch> u16_patches;
+    std::vector<FloatPatch> float_patches;
 
     bool optional_zoom_blur = false;
     bool optional_multitexture_overlay = false;
@@ -107,33 +108,44 @@ namespace {
     void patch_detail_level(char *tag_data) noexcept {
         auto *value = reinterpret_cast<uint16_t *>(tag_data + SHADER_DETAIL_LEVEL_OFFSET);
         if (*value == 3) return;
-        detail_level_patches.push_back({value, *value});
+        u16_patches.push_back({value, *value});
         *value = 3; // turd
     }
 
     void patch_float(char *tag_data, size_t offset, float new_value) noexcept {
         auto *value = reinterpret_cast<float *>(tag_data + offset);
-        water_float_patches.push_back({value, *value});
+        float_patches.push_back({value, *value});
         *value = new_value;
     }
 
     void patch_u16_flags(char *tag_data, size_t offset, uint16_t clear_bits) noexcept {
         auto *value = reinterpret_cast<uint16_t *>(tag_data + offset);
-        detail_level_patches.push_back({value, *value});
+        u16_patches.push_back({value, *value});
         *value = static_cast<uint16_t>(*value & ~clear_bits);
+    }
+
+    void force_model_super_low_lod(char *tag_data) noexcept {
+        // Any on-screen size below these huge cutoffs → lower LOD.
+        // Setting all higher cutoffs impossibly high forces super-low geometry.
+        patch_float(tag_data, GBX_SUPER_HIGH_CUTOFF, LOD_FORCE_SUPER_LOW);
+        patch_float(tag_data, GBX_HIGH_CUTOFF,       LOD_FORCE_SUPER_LOW);
+        patch_float(tag_data, GBX_MEDIUM_CUTOFF,     LOD_FORCE_SUPER_LOW);
+        patch_float(tag_data, GBX_LOW_CUTOFF,        LOD_FORCE_SUPER_LOW);
+        // super-low cutoff can stay 0 (always available)
+        patch_float(tag_data, GBX_SUPER_LOW_CUTOFF,  0.0f);
     }
 
     void restore_tag_patches() noexcept {
         for (auto it = dependency_patches.rbegin(); it != dependency_patches.rend(); ++it)
             *it->datum = it->old_value;
-        for (auto it = detail_level_patches.rbegin(); it != detail_level_patches.rend(); ++it)
+        for (auto it = u16_patches.rbegin(); it != u16_patches.rend(); ++it)
             *it->value = it->old_value;
-        for (auto it = water_float_patches.rbegin(); it != water_float_patches.rend(); ++it)
+        for (auto it = float_patches.rbegin(); it != float_patches.rend(); ++it)
             *it->value = it->old_value;
 
         dependency_patches.clear();
-        detail_level_patches.clear();
-        water_float_patches.clear();
+        u16_patches.clear();
+        float_patches.clear();
     }
 
     void apply_tag_profile(int level) noexcept {
@@ -150,7 +162,6 @@ namespace {
 
             switch (tag.tag_class) {
                 case HaloCE::TAG_CLASS_INT_SHADER_ENVIRONMENT:
-                    // World / terrain / rocks / grass (BSP)
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SENV_PRIMARY_DETAIL_OFFSET);
                     patch_dependency(tag.data, SENV_SECONDARY_DETAIL_OFFSET);
@@ -158,9 +169,9 @@ namespace {
                     patch_dependency(tag.data, SENV_BUMP_MAP_OFFSET);
 
                     if (level >= 3) {
+                        // Flat / white terrain like your screenshot #4
                         patch_dependency(tag.data, SENV_BASE_MAP_OFFSET);
-                        // Kill dynamic mirrors + cube reflections
-                        patch_u16_flags(tag.data, SENV_REFLECTION_FLAGS_OFFSET, 0x1); // clear dynamic mirror
+                        patch_u16_flags(tag.data, SENV_REFLECTION_FLAGS_OFFSET, 0x1);
                         patch_float(tag.data, SENV_PERP_BRIGHTNESS_OFFSET, 0.0f);
                         patch_float(tag.data, SENV_PARA_BRIGHTNESS_OFFSET, 0.0f);
                         patch_dependency(tag.data, SENV_REFLECTION_CUBE_OFFSET);
@@ -168,18 +179,21 @@ namespace {
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SHADER_MODEL:
-                    // Characters, weapons, trees, rocks, vehicles, scenery props
+                    // Keep base map so Spartan / Warthog / weapons keep color
+                    // (matches classic potato screenshots)
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SOSO_DETAIL_MAP_OFFSET);
                     patch_dependency(tag.data, SOSO_MULTIPURPOSE_MAP_OFFSET);
                     patch_float(tag.data, SOSO_PERP_BRIGHTNESS_OFFSET, 0.0f);
                     patch_float(tag.data, SOSO_PARA_BRIGHTNESS_OFFSET, 0.0f);
                     patch_dependency(tag.data, SOSO_REFLECTION_CUBE_OFFSET);
+                    break;
 
-                    if (level >= 4) {
-                        // Ultra: also strip the base diffuse of models
-                        // (characters / weapons / trees look flat – intentional)
-                        patch_dependency(tag.data, SOSO_BASE_MAP_OFFSET);
+                case HaloCE::TAG_CLASS_INT_GBXMODEL:
+                    // *** Model details → minimum (super-low geometry) ***
+                    // This is the effect from your classic potato screenshots.
+                    if (level >= 2) {
+                        force_model_super_low_lod(tag.data);
                     }
                     break;
 
@@ -194,29 +208,22 @@ namespace {
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_GLASS:
-                    // Windows / mirrors – NOT used by Active Camo
                     if (level >= 3) {
                         patch_float(tag.data, SGLA_PERP_BRIGHTNESS_OFFSET, 0.0f);
                         patch_float(tag.data, SGLA_PARA_BRIGHTNESS_OFFSET, 0.0f);
                         patch_dependency(tag.data, SGLA_REFLECTION_MAP_OFFSET);
                         patch_dependency(tag.data, SGLA_BUMP_MAP_OFFSET);
                         patch_dependency(tag.data, SGLA_DIFFUSE_DETAIL_OFFSET);
-                        if (level >= 4) {
-                            patch_dependency(tag.data, SGLA_DIFFUSE_MAP_OFFSET);
-                        }
                     }
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SKY:
-                    // Disable sky model draw (big fillrate win outdoors)
                     if (level >= 3) {
                         patch_dependency(tag.data, SKY_MODEL_OFFSET);
                     }
                     break;
 
                 default:
-                    // chicago / chicago_extended / plasma left completely alone
-                    // → Active Camo stays intact
                     break;
             }
         }
@@ -224,8 +231,8 @@ namespace {
 
     void on_map_load() noexcept {
         dependency_patches.clear();
-        detail_level_patches.clear();
-        water_float_patches.clear();
+        u16_patches.clear();
+        float_patches.clear();
         apply_tag_profile(active_level);
     }
 
