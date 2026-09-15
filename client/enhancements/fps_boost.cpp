@@ -17,47 +17,62 @@
 #include "../visuals/anisotropic_filtering.h"
 
 // =============================================================================
-// Chimera Potato (improved)
+// Chimera Potato (aggressive, camo-safe)
 // =============================================================================
-// Goal: give the biggest possible FPS boost on low-end hardware while keeping
-// Active Camo 100% intact.
+// Goal: maximum FPS on potato hardware while NEVER breaking Active Camo.
 //
-// Design rules (never break these):
-//   1. NEVER touch transparent shader tags (TAG_CLASS_INT_SHADER_TRANSPARENT_*,
-//      especially chicago / chicago_extended). Active Camo depends on them and
-//      on the alpha render target.
-//   2. Never disable the alpha render target.
-//   3. Player / weapon base maps (shader_model) stay intact so characters still
-//      look recognizable.
-//   4. Only visual/tag data is modified. No gameplay, magnetism, hitreg, or
-//      object table changes.
-//
-// The tag edits only null the last 4 bytes of a TagDependency (the datum index)
-// and save the original value so everything can be restored cleanly.
+// Rules:
+//   1. NEVER touch transparent chicago / chicago_extended / plasma tags.
+//   2. NEVER disable the alpha render target.
+//   3. Glass reflections/mirrors and sky CAN be killed (not used by camo).
+//   4. On ultra we intentionally flatten model/weapon/scenery textures.
 // =============================================================================
 
 namespace {
     constexpr uint32_t NULL_TAG_ID = 0xFFFFFFFFu;
 
-    // Shader::detail_level (uint16) at offset 0x02 of every shader tag.
+    // Common shader header
     constexpr size_t SHADER_DETAIL_LEVEL_OFFSET = 0x02;
 
-    // shader_environment (senv)
+    // shader_environment (senv) – runtime offsets used by this fork
     constexpr size_t SENV_BASE_MAP_OFFSET         = 0x88;
     constexpr size_t SENV_PRIMARY_DETAIL_OFFSET   = 0xB8;
     constexpr size_t SENV_SECONDARY_DETAIL_OFFSET = 0xCC;
     constexpr size_t SENV_MICRO_DETAIL_OFFSET     = 0xFC;
     constexpr size_t SENV_BUMP_MAP_OFFSET         = 0x128;
+    // Reflection section (cube map + brightness) – kills dynamic mirrors
+    constexpr size_t SENV_REFLECTION_FLAGS_OFFSET = 0x2F4;
+    constexpr size_t SENV_PERP_BRIGHTNESS_OFFSET  = 0x318;
+    constexpr size_t SENV_PARA_BRIGHTNESS_OFFSET  = 0x31C;
+    constexpr size_t SENV_REFLECTION_CUBE_OFFSET  = 0x340;
 
-    // shader_model (soso)
-    constexpr size_t SOSO_DETAIL_MAP_OFFSET = 0xEC;
+    // shader_model (soso) – characters, weapons, trees, rocks, scenery
+    // Detail map offset was already verified in this tree (0xEC).
+    // Base / multipurpose derived relative to that known anchor.
+    constexpr size_t SOSO_BASE_MAP_OFFSET         = 0xB4;
+    constexpr size_t SOSO_MULTIPURPOSE_MAP_OFFSET = 0xCC;
+    constexpr size_t SOSO_DETAIL_MAP_OFFSET       = 0xEC;
+    constexpr size_t SOSO_PERP_BRIGHTNESS_OFFSET  = 0x18C;
+    constexpr size_t SOSO_PARA_BRIGHTNESS_OFFSET  = 0x19C;
+    constexpr size_t SOSO_REFLECTION_CUBE_OFFSET  = 0x1AC;
 
-    // shader_transparent_water (swat) - only water is allowed to disappear
+    // shader_transparent_water (swat)
     constexpr size_t SWAT_BASE_MAP_OFFSET                 = 0x4C;
     constexpr size_t SWAT_REFLECTION_MAP_OFFSET           = 0x7C;
     constexpr size_t SWAT_RIPPLE_MAP_OFFSET               = 0x9C;
     constexpr size_t SWAT_PERPENDICULAR_BRIGHTNESS_OFFSET = 0x5C;
     constexpr size_t SWAT_PARALLEL_BRIGHTNESS_OFFSET      = 0x6C;
+
+    // shader_transparent_glass (sgla) – mirrors / windows (NOT active camo)
+    constexpr size_t SGLA_REFLECTION_MAP_OFFSET  = 0x70;
+    constexpr size_t SGLA_BUMP_MAP_OFFSET         = 0x88;
+    constexpr size_t SGLA_DIFFUSE_MAP_OFFSET      = 0xA0;
+    constexpr size_t SGLA_DIFFUSE_DETAIL_OFFSET   = 0xB8;
+    constexpr size_t SGLA_PERP_BRIGHTNESS_OFFSET  = 0x50;
+    constexpr size_t SGLA_PARA_BRIGHTNESS_OFFSET  = 0x60;
+
+    // sky tag – model reference is the expensive draw
+    constexpr size_t SKY_MODEL_OFFSET = 0x00;
 
     struct DependencyPatch {
         uint32_t *datum;
@@ -80,7 +95,7 @@ namespace {
 
     bool optional_zoom_blur = false;
     bool optional_multitexture_overlay = false;
-    int active_level = 0;   // 0 = off, 1 = low, 2 = medium, 3 = high, 4 = ultra
+    int active_level = 0;
 
     void patch_dependency(char *tag_data, size_t offset) noexcept {
         auto *datum = reinterpret_cast<uint32_t *>(tag_data + offset + 12);
@@ -91,16 +106,21 @@ namespace {
 
     void patch_detail_level(char *tag_data) noexcept {
         auto *value = reinterpret_cast<uint16_t *>(tag_data + SHADER_DETAIL_LEVEL_OFFSET);
-        // 3 = "turd" (lowest lightmap / shader detail)
         if (*value == 3) return;
         detail_level_patches.push_back({value, *value});
-        *value = 3;
+        *value = 3; // turd
     }
 
-    void patch_water_float(char *tag_data, size_t offset, float new_value) noexcept {
+    void patch_float(char *tag_data, size_t offset, float new_value) noexcept {
         auto *value = reinterpret_cast<float *>(tag_data + offset);
         water_float_patches.push_back({value, *value});
         *value = new_value;
+    }
+
+    void patch_u16_flags(char *tag_data, size_t offset, uint16_t clear_bits) noexcept {
+        auto *value = reinterpret_cast<uint16_t *>(tag_data + offset);
+        detail_level_patches.push_back({value, *value});
+        *value = static_cast<uint16_t>(*value & ~clear_bits);
     }
 
     void restore_tag_patches() noexcept {
@@ -130,7 +150,7 @@ namespace {
 
             switch (tag.tag_class) {
                 case HaloCE::TAG_CLASS_INT_SHADER_ENVIRONMENT:
-                    // Medium+: remove expensive material stack from BSP
+                    // World / terrain / rocks / grass (BSP)
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SENV_PRIMARY_DETAIL_OFFSET);
                     patch_dependency(tag.data, SENV_SECONDARY_DETAIL_OFFSET);
@@ -138,50 +158,78 @@ namespace {
                     patch_dependency(tag.data, SENV_BUMP_MAP_OFFSET);
 
                     if (level >= 3) {
-                        // High/Ultra: also remove the base texture of the world
                         patch_dependency(tag.data, SENV_BASE_MAP_OFFSET);
+                        // Kill dynamic mirrors + cube reflections
+                        patch_u16_flags(tag.data, SENV_REFLECTION_FLAGS_OFFSET, 0x1); // clear dynamic mirror
+                        patch_float(tag.data, SENV_PERP_BRIGHTNESS_OFFSET, 0.0f);
+                        patch_float(tag.data, SENV_PARA_BRIGHTNESS_OFFSET, 0.0f);
+                        patch_dependency(tag.data, SENV_REFLECTION_CUBE_OFFSET);
                     }
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SHADER_MODEL:
-                    // Always keep base maps of players/weapons so they stay readable.
-                    // Only strip detail maps + force lowest lightmap detail.
+                    // Characters, weapons, trees, rocks, vehicles, scenery props
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SOSO_DETAIL_MAP_OFFSET);
+                    patch_dependency(tag.data, SOSO_MULTIPURPOSE_MAP_OFFSET);
+                    patch_float(tag.data, SOSO_PERP_BRIGHTNESS_OFFSET, 0.0f);
+                    patch_float(tag.data, SOSO_PARA_BRIGHTNESS_OFFSET, 0.0f);
+                    patch_dependency(tag.data, SOSO_REFLECTION_CUBE_OFFSET);
+
+                    if (level >= 4) {
+                        // Ultra: also strip the base diffuse of models
+                        // (characters / weapons / trees look flat – intentional)
+                        patch_dependency(tag.data, SOSO_BASE_MAP_OFFSET);
+                    }
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_WATER:
                     if (level >= 3) {
-                        // Water is allowed to disappear completely.
-                        // IMPORTANT: we deliberately do NOT touch any other
-                        // transparent class (chicago, chicago_extended, etc.).
                         patch_dependency(tag.data, SWAT_BASE_MAP_OFFSET);
                         patch_dependency(tag.data, SWAT_REFLECTION_MAP_OFFSET);
                         patch_dependency(tag.data, SWAT_RIPPLE_MAP_OFFSET);
-                        patch_water_float(tag.data, SWAT_PERPENDICULAR_BRIGHTNESS_OFFSET, 0.0f);
-                        patch_water_float(tag.data, SWAT_PARALLEL_BRIGHTNESS_OFFSET, 0.0f);
+                        patch_float(tag.data, SWAT_PERPENDICULAR_BRIGHTNESS_OFFSET, 0.0f);
+                        patch_float(tag.data, SWAT_PARALLEL_BRIGHTNESS_OFFSET, 0.0f);
+                    }
+                    break;
+
+                case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_GLASS:
+                    // Windows / mirrors – NOT used by Active Camo
+                    if (level >= 3) {
+                        patch_float(tag.data, SGLA_PERP_BRIGHTNESS_OFFSET, 0.0f);
+                        patch_float(tag.data, SGLA_PARA_BRIGHTNESS_OFFSET, 0.0f);
+                        patch_dependency(tag.data, SGLA_REFLECTION_MAP_OFFSET);
+                        patch_dependency(tag.data, SGLA_BUMP_MAP_OFFSET);
+                        patch_dependency(tag.data, SGLA_DIFFUSE_DETAIL_OFFSET);
+                        if (level >= 4) {
+                            patch_dependency(tag.data, SGLA_DIFFUSE_MAP_OFFSET);
+                        }
+                    }
+                    break;
+
+                case HaloCE::TAG_CLASS_INT_SKY:
+                    // Disable sky model draw (big fillrate win outdoors)
+                    if (level >= 3) {
+                        patch_dependency(tag.data, SKY_MODEL_OFFSET);
                     }
                     break;
 
                 default:
-                    // Everything else (especially all transparent shaders used
-                    // by Active Camo and visual effects) is left completely alone.
+                    // chicago / chicago_extended / plasma left completely alone
+                    // → Active Camo stays intact
                     break;
             }
         }
     }
 
     void on_map_load() noexcept {
-        // Map load replaces the entire tag array → old pointers are invalid.
         dependency_patches.clear();
         detail_level_patches.clear();
         water_float_patches.clear();
-
         apply_tag_profile(active_level);
     }
 
     void set_af(bool enabled) noexcept {
-        // Force anisotropic filtering off for every potato level > 0
         auto &setting = **reinterpret_cast<char **>(get_signature("af_is_enabled_sig").address() + 1);
         setting = enabled ? 1 : 0;
     }
@@ -203,29 +251,25 @@ namespace {
         block_zoom_blur_command(1, arg);
     }
 
-    // Convert classic potato names → numeric level
     int parse_level(const char *arg) noexcept {
         if (!arg) return -1;
 
-        // Numeric first
         char *end = nullptr;
         long n = strtol(arg, &end, 10);
         if (end != arg && *end == '\0' && n >= 0 && n <= 4)
             return static_cast<int>(n);
 
-        // Classic names (case-insensitive)
         char buf[16] = {};
         size_t i = 0;
         for (; arg[i] && i < sizeof(buf) - 1; ++i)
             buf[i] = static_cast<char>(tolower(static_cast<unsigned char>(arg[i])));
         buf[i] = '\0';
 
-        if (strcmp(buf, "off") == 0 || strcmp(buf, "0") == 0) return 0;
-        if (strcmp(buf, "low") == 0 || strcmp(buf, "1") == 0) return 1;
-        if (strcmp(buf, "medium") == 0 || strcmp(buf, "med") == 0 || strcmp(buf, "2") == 0) return 2;
-        if (strcmp(buf, "high") == 0 || strcmp(buf, "3") == 0) return 3;
-        if (strcmp(buf, "ultra") == 0 || strcmp(buf, "max") == 0 || strcmp(buf, "4") == 0) return 4;
-
+        if (strcmp(buf, "off") == 0) return 0;
+        if (strcmp(buf, "low") == 0) return 1;
+        if (strcmp(buf, "medium") == 0 || strcmp(buf, "med") == 0) return 2;
+        if (strcmp(buf, "high") == 0) return 3;
+        if (strcmp(buf, "ultra") == 0 || strcmp(buf, "max") == 0) return 4;
         return -1;
     }
 
@@ -235,16 +279,15 @@ namespace {
 
         if (level == 0) {
             restore_tag_patches();
-            set_af(true);                     // restore AF to whatever the user had
+            set_af(true);
             set_multitexture_overlay(false);
             set_zoom_blur(false);
             const char *arg[] = {"false"};
             block_firing_particles_command(1, arg);
         } else {
-            // All potato levels force these off
             set_af(false);
             set_multitexture_overlay(true);
-            set_zoom_blur(false);             // keep normal zoom blur (user preference)
+            set_zoom_blur(false);
             const char *arg[] = {"true"};
             block_firing_particles_command(1, arg);
 
@@ -268,7 +311,6 @@ namespace {
 }
 
 void initialize_fps_boost() noexcept {
-    // Optional signatures – failure must never prevent Chimera from loading.
     optional_multitexture_overlay = find_multitexture_overlay_signature();
     optional_zoom_blur = find_zoom_blur_signatures();
     add_map_load_event(on_map_load, EVENT_PRIORITY_AFTER);

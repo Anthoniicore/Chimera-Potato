@@ -1,49 +1,47 @@
-# Chimera Potato (improved FPS mode)
+# Chimera Potato (aggressive FPS mode)
 
-Target: Halo Custom Edition 1.10 – Chimera600-derived fork.
+Target: Halo Custom Edition 1.10
 
-This is a modern, safer recreation of the old `chimera_potato` feature that existed in early Chimera builds.  
-It is designed to give the largest possible FPS increase on low-end / “potato” PCs while **never touching Active Camo**.
+Much more aggressive than the first version. Designed for very old / low-end PCs.
 
 ## Commands
 
 ```text
 chimera_potato [off/low/medium/high/ultra]
 chimera_potato [0-4]
-
-chimera_fps_boost [same arguments]     # alias
+chimera_fps_boost   # alias
 ```
 
 ## Levels
 
-| Level   | Name    | What it does                                                                 | Camo safe? |
-|---------|---------|------------------------------------------------------------------------------|------------|
-| 0       | off     | Restores all visual changes                                                  | Yes        |
-| 1       | low     | AF off + firing particles off + multitexture overlays off                    | Yes        |
-| 2       | medium  | low + strip BSP detail/bump maps + force lowest lightmap detail              | Yes        |
-| 3       | high    | medium + strip BSP base maps + remove water textures/brightness              | Yes        |
-| 4       | ultra   | high + extra model detail stripping (player/weapon **base** maps kept)       | Yes        |
+| Level | Name   | Changes |
+|-------|--------|---------|
+| 0     | off    | Restore everything |
+| 1     | low    | AF off, firing particles off, multitexture overlays off |
+| 2     | medium | + strip BSP detail/bump maps, lowest lightmap detail |
+| 3     | high   | + strip BSP base maps, kill water, **kill mirrors/reflections**, **disable sky model**, strip glass reflections |
+| 4     | ultra  | + **strip base maps of characters / weapons / trees / rocks / scenery** (flat look, max FPS) |
 
-### What is **never** touched
-- Any transparent shader tag (chicago, chicago_extended, etc.)
-- The alpha render target (required for Active Camo distortion)
-- Player / weapon base maps (so characters stay recognizable)
-- Gameplay, magnetism, hit registration, object tables, interpolation
+## What ultra now does (your complaints)
 
-Only visual tag dependencies are modified, and they are fully restored when you go back to `off` or change map.
+- **Espejos / mirrors**: reflection cube maps cleared on environment + glass, dynamic mirror flag cleared, reflection brightness forced to 0.
+- **Texturas de árboles, piedras, pasto, enemigos, personaje, armas**: `shader_model` base + multipurpose + detail + reflections stripped on ultra.
+- **Cielo**: sky model dependency nulled on high/ultra (no sky draw).
 
-## Recommended usage for maximum FPS
+## Still protected (Active Camo)
+
+- Never touches `shader_transparent_chicago` / `chicago_extended` / `plasma`
+- Never touches the alpha render target
+- Only visual tag dependencies are edited; fully reversible with `chimera_potato off`
+
+## Recommended for max FPS
 
 ```text
 chimera_potato ultra
-chimera_interpolate off          # or low
+chimera_interpolate off
 chimera_af false
-chimera_block_firing_particles true
-# + lower resolution (e.g. 1024x768 or 800x600)
 ```
 
-On very weak GPUs (old integrated graphics, low VRAM cards) the combination of `ultra` + low resolution + interpolation off can easily give 2×–3× FPS or more compared with stock Chimera settings.
++ lower resolution (800x600 / 1024x768)
 
-## Build
-
-Just run `build.bat` as usual. The potato module is already included in the link step.
+Rebuild with `build.bat release` or wait for the GitHub Actions artifact.
