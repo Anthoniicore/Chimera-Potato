@@ -17,13 +17,14 @@
 #include "../visuals/anisotropic_filtering.h"
 
 // =============================================================================
-// Chimera Potato – match classic potato look from your screenshots
+// Chimera Potato – lower detail to minimum WITHOUT deleting objects
 // =============================================================================
-// - Environment (BSP): strip textures hard → flat / white ground
-// - Models (characters, weapons, warthog, scenery): KEEP base color maps
-//   but force SUPER-LOW geometry LOD (the "model details" effect)
-// - Mirrors / sky / water killed on high+
-// - Active Camo never touched (no chicago / plasma / alpha RT)
+// Rules:
+//   - NEVER make models / scenery / trees / rocks invisible
+//   - NEVER strip bump maps on alpha-tested shaders (trees, grates, foliage)
+//   - NEVER force LOD in a way that removes geometry
+//   - Only reduce texture layers and reflections for FPS
+//   - Active Camo stays 100% intact (no chicago / plasma / alpha RT)
 // =============================================================================
 
 namespace {
@@ -31,7 +32,8 @@ namespace {
 
     constexpr size_t SHADER_DETAIL_LEVEL_OFFSET = 0x02;
 
-    // shader_environment
+    // shader_environment – after Shader base (40 bytes)
+    constexpr size_t SENV_FLAGS_OFFSET            = 0x28; // bit0 = alpha tested
     constexpr size_t SENV_BASE_MAP_OFFSET         = 0x88;
     constexpr size_t SENV_PRIMARY_DETAIL_OFFSET   = 0xB8;
     constexpr size_t SENV_SECONDARY_DETAIL_OFFSET = 0xCC;
@@ -42,7 +44,7 @@ namespace {
     constexpr size_t SENV_PARA_BRIGHTNESS_OFFSET  = 0x31C;
     constexpr size_t SENV_REFLECTION_CUBE_OFFSET  = 0x340;
 
-    // shader_model – keep BASE map (armor/weapon color), strip the rest
+    // shader_model – always keep BASE map so objects stay visible & colored
     constexpr size_t SOSO_MULTIPURPOSE_MAP_OFFSET = 0xCC;
     constexpr size_t SOSO_DETAIL_MAP_OFFSET       = 0xEC;
     constexpr size_t SOSO_PERP_BRIGHTNESS_OFFSET  = 0x18C;
@@ -62,18 +64,11 @@ namespace {
     constexpr size_t SGLA_PERP_BRIGHTNESS_OFFSET  = 0x50;
     constexpr size_t SGLA_PARA_BRIGHTNESS_OFFSET  = 0x60;
 
-    constexpr size_t SKY_MODEL_OFFSET = 0x00;
-
-    // gbxmodel LOD cutoffs (floats, pixels of bounding sphere)
-    // Layout from invader: after flags(4) + checksum(4)
+    // Mild LOD preference (NOT deletion). Only nudges cutoffs down a bit.
     constexpr size_t GBX_SUPER_HIGH_CUTOFF = 0x08;
     constexpr size_t GBX_HIGH_CUTOFF       = 0x0C;
     constexpr size_t GBX_MEDIUM_CUTOFF     = 0x10;
     constexpr size_t GBX_LOW_CUTOFF        = 0x14;
-    constexpr size_t GBX_SUPER_LOW_CUTOFF  = 0x18;
-
-    // Force higher LODs to require an impossible on-screen size → always super-low
-    constexpr float LOD_FORCE_SUPER_LOW = 999999.0f;
 
     struct DependencyPatch {
         uint32_t *datum;
@@ -124,15 +119,34 @@ namespace {
         *value = static_cast<uint16_t>(*value & ~clear_bits);
     }
 
-    void force_model_super_low_lod(char *tag_data) noexcept {
-        // Any on-screen size below these huge cutoffs → lower LOD.
-        // Setting all higher cutoffs impossibly high forces super-low geometry.
-        patch_float(tag_data, GBX_SUPER_HIGH_CUTOFF, LOD_FORCE_SUPER_LOW);
-        patch_float(tag_data, GBX_HIGH_CUTOFF,       LOD_FORCE_SUPER_LOW);
-        patch_float(tag_data, GBX_MEDIUM_CUTOFF,     LOD_FORCE_SUPER_LOW);
-        patch_float(tag_data, GBX_LOW_CUTOFF,        LOD_FORCE_SUPER_LOW);
-        // super-low cutoff can stay 0 (always available)
-        patch_float(tag_data, GBX_SUPER_LOW_CUTOFF,  0.0f);
+    bool is_alpha_tested_senv(char *tag_data) noexcept {
+        auto flags = *reinterpret_cast<uint16_t *>(tag_data + SENV_FLAGS_OFFSET);
+        return (flags & 0x1) != 0; // alpha tested
+    }
+
+    // Prefer lower LODs sooner, but NEVER hide the model (no impossible cutoffs)
+    void prefer_lower_model_lod(char *tag_data, int level) noexcept {
+        // Scale existing cutoffs down so low/medium LODs kick in earlier.
+        // Multiplier: medium=0.5, high=0.35, ultra=0.25 of original thresholds.
+        float scale = 1.0f;
+        if (level >= 4) scale = 0.25f;
+        else if (level >= 3) scale = 0.35f;
+        else if (level >= 2) scale = 0.50f;
+        else return;
+
+        auto scale_cutoff = [&](size_t offset) {
+            auto *v = reinterpret_cast<float *>(tag_data + offset);
+            if (*v <= 0.0f) return; // leave zero alone
+            float_patches.push_back({v, *v});
+            *v = *v * scale;
+            if (*v < 1.0f) *v = 1.0f; // keep a tiny positive threshold
+        };
+
+        scale_cutoff(GBX_SUPER_HIGH_CUTOFF);
+        scale_cutoff(GBX_HIGH_CUTOFF);
+        scale_cutoff(GBX_MEDIUM_CUTOFF);
+        scale_cutoff(GBX_LOW_CUTOFF);
+        // super-low cutoff untouched – model always has a valid mesh
     }
 
     void restore_tag_patches() noexcept {
@@ -161,26 +175,38 @@ namespace {
             if (!tag.data) continue;
 
             switch (tag.tag_class) {
-                case HaloCE::TAG_CLASS_INT_SHADER_ENVIRONMENT:
+                case HaloCE::TAG_CLASS_INT_SHADER_ENVIRONMENT: {
+                    const bool alpha_tested = is_alpha_tested_senv(tag.data);
+
                     patch_detail_level(tag.data);
+                    // Detail layers are safe to remove (not used for alpha test)
                     patch_dependency(tag.data, SENV_PRIMARY_DETAIL_OFFSET);
                     patch_dependency(tag.data, SENV_SECONDARY_DETAIL_OFFSET);
                     patch_dependency(tag.data, SENV_MICRO_DETAIL_OFFSET);
-                    patch_dependency(tag.data, SENV_BUMP_MAP_OFFSET);
+
+                    // Bump map: ONLY strip if NOT alpha-tested
+                    // (alpha-tested trees/foliage/grates need bump alpha to stay visible)
+                    if (!alpha_tested) {
+                        patch_dependency(tag.data, SENV_BUMP_MAP_OFFSET);
+                    }
 
                     if (level >= 3) {
-                        // Flat / white terrain like your screenshot #4
-                        patch_dependency(tag.data, SENV_BASE_MAP_OFFSET);
+                        // Base map: only strip on solid terrain, never on alpha-tested
+                        if (!alpha_tested) {
+                            patch_dependency(tag.data, SENV_BASE_MAP_OFFSET);
+                        }
+                        // Kill mirrors / cube reflections
                         patch_u16_flags(tag.data, SENV_REFLECTION_FLAGS_OFFSET, 0x1);
                         patch_float(tag.data, SENV_PERP_BRIGHTNESS_OFFSET, 0.0f);
                         patch_float(tag.data, SENV_PARA_BRIGHTNESS_OFFSET, 0.0f);
                         patch_dependency(tag.data, SENV_REFLECTION_CUBE_OFFSET);
                     }
                     break;
+                }
 
                 case HaloCE::TAG_CLASS_INT_SHADER_MODEL:
-                    // Keep base map so Spartan / Warthog / weapons keep color
-                    // (matches classic potato screenshots)
+                    // Characters, weapons, vehicles, scenery props
+                    // ALWAYS keep base map → object stays visible and colored
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SOSO_DETAIL_MAP_OFFSET);
                     patch_dependency(tag.data, SOSO_MULTIPURPOSE_MAP_OFFSET);
@@ -190,11 +216,8 @@ namespace {
                     break;
 
                 case HaloCE::TAG_CLASS_INT_GBXMODEL:
-                    // *** Model details → minimum (super-low geometry) ***
-                    // This is the effect from your classic potato screenshots.
-                    if (level >= 2) {
-                        force_model_super_low_lod(tag.data);
-                    }
+                    // Prefer lower LODs earlier – models NEVER disappear
+                    prefer_lower_model_lod(tag.data, level);
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_WATER:
@@ -208,18 +231,23 @@ namespace {
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_GLASS:
+                    // Only reflections – glass body stays so you still see windows
                     if (level >= 3) {
                         patch_float(tag.data, SGLA_PERP_BRIGHTNESS_OFFSET, 0.0f);
                         patch_float(tag.data, SGLA_PARA_BRIGHTNESS_OFFSET, 0.0f);
                         patch_dependency(tag.data, SGLA_REFLECTION_MAP_OFFSET);
-                        patch_dependency(tag.data, SGLA_BUMP_MAP_OFFSET);
                         patch_dependency(tag.data, SGLA_DIFFUSE_DETAIL_OFFSET);
+                        // do NOT strip bump/diffuse – keep glass visible
                     }
                     break;
 
                 case HaloCE::TAG_CLASS_INT_SKY:
-                    if (level >= 3) {
-                        patch_dependency(tag.data, SKY_MODEL_OFFSET);
+                    // Soften sky cost without removing the whole sky model on high;
+                    // only null model on ultra if user really wants max FPS
+                    if (level >= 4) {
+                        // Optional: leave sky present so outdoor orientation remains
+                        // Comment next line if you want sky gone again on ultra:
+                        // patch_dependency(tag.data, 0x00);
                     }
                     break;
 
