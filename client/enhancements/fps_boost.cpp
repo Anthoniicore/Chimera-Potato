@@ -21,15 +21,14 @@
 #include "../visuals/anisotropic_filtering.h"
 
 // =============================================================================
-// Chimera Potato – engine patch (original 2018) + camo-safe limits
+// Original Chimera potato (2018) – reverse engineered
 // =============================================================================
-// Original ultra sets rasterizer flags that make Active Camo fully invisible.
-// We keep the FPS-oriented disables but NEVER:
-//   - set OFF_00 / OFF_01 (opaque-only style flags in original ultra)
-//   - zero OFF_04 word aggressively on high/ultra
-//   - NOP potato_workaround (can break transparent paths)
-//   - null shader_model multipurpose maps (Active Camo uses them)
-//   - touch chicago / plasma / generic transparent shaders
+// Level 2 (medium) keeps Active Camo visible.
+// Levels 3/4 in the original set OFF_00=1 and OFF_01=1 which force a path that
+// makes camo wearers fully invisible. We keep the rest of the original ultra
+// writes for FPS, but skip OFF_00/OFF_01 and use OFF_04=2 (medium) instead of 0.
+// Never null shader_model multipurpose maps (camo channel).
+// Never touch chicago / plasma / generic transparent shaders.
 // =============================================================================
 
 namespace {
@@ -42,6 +41,15 @@ namespace {
         0xE5, 0x00, 0x00
     };
 
+    const short POTATO_WORKAROUND_SIG[] = {
+        0x0F, 0x8F, 0xAF, 0x00, 0x00, 0x00, 0x40, 0x66,
+        0x3B, 0xC3, 0x7C, 0xE4, 0xE9, 0xBF, 0x00, 0x00,
+        0x00
+    };
+
+    constexpr size_t OFF_00 = 0x00; // SKIPPED – breaks Active Camo
+    constexpr size_t OFF_01 = 0x01; // SKIPPED – breaks Active Camo
+    constexpr size_t OFF_04 = 0x04; // word
     constexpr size_t OFF_09 = 0x09;
     constexpr size_t OFF_0E = 0x0E;
     constexpr size_t OFF_10 = 0x10;
@@ -49,6 +57,10 @@ namespace {
     constexpr size_t OFF_14 = 0x14;
     constexpr size_t OFF_16 = 0x16;
     constexpr size_t OFF_17 = 0x17;
+    constexpr size_t OFF_18 = 0x18;
+    constexpr size_t OFF_1B = 0x1B;
+    constexpr size_t OFF_23 = 0x23;
+    constexpr size_t OFF_6C = 0x6C;
 
     constexpr size_t SHADER_DETAIL_LEVEL_OFFSET = 0x02;
     constexpr size_t SENV_FLAGS_OFFSET            = 0x28;
@@ -82,11 +94,16 @@ namespace {
     struct U16Patch { uint16_t *value; uint16_t old_value; };
     struct FloatPatch { float *value; float old_value; };
     struct BytePatch { uint8_t *addr; uint8_t old_value; };
+    struct WordPatch { uint16_t *addr; uint16_t old_value; };
+    struct CodePatch { uint8_t *addr; uint8_t old_bytes[6]; };
 
     std::vector<DependencyPatch> dependency_patches;
     std::vector<U16Patch> u16_patches;
     std::vector<FloatPatch> float_patches;
     std::vector<BytePatch> engine_byte_patches;
+    std::vector<WordPatch> engine_word_patches;
+    CodePatch workaround_patch = {};
+    bool workaround_patched = false;
 
     bool optional_zoom_blur = false;
     bool optional_multitexture_overlay = false;
@@ -144,6 +161,35 @@ namespace {
         VirtualProtect(p, 1, old, &old);
     }
 
+    static void engine_write_word(size_t offset, uint16_t value) noexcept {
+        if (!rasterizer_flags) return;
+        auto *p = reinterpret_cast<uint16_t *>(rasterizer_flags + offset);
+        engine_word_patches.push_back({p, *p});
+        DWORD old;
+        VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old);
+        *p = value;
+        VirtualProtect(p, 2, old, &old);
+    }
+
+    static void apply_workaround_nop(bool enable) noexcept {
+        void *match = scan_module(POTATO_WORKAROUND_SIG, sizeof(POTATO_WORKAROUND_SIG) / sizeof(POTATO_WORKAROUND_SIG[0]));
+        if (!match) return;
+        auto *p = static_cast<uint8_t *>(match);
+        DWORD old;
+        VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old);
+        if (enable) {
+            if (!workaround_patched) {
+                memcpy(workaround_patch.old_bytes, p, 6);
+                workaround_patch.addr = p;
+                workaround_patched = true;
+            }
+            memset(p, 0x90, 6);
+        } else if (workaround_patched && workaround_patch.addr == p) {
+            memcpy(p, workaround_patch.old_bytes, 6);
+        }
+        VirtualProtect(p, 6, old, &old);
+    }
+
     static void restore_engine_patches() noexcept {
         for (auto it = engine_byte_patches.rbegin(); it != engine_byte_patches.rend(); ++it) {
             DWORD old;
@@ -151,28 +197,61 @@ namespace {
             *it->addr = it->old_value;
             VirtualProtect(it->addr, 1, old, &old);
         }
+        for (auto it = engine_word_patches.rbegin(); it != engine_word_patches.rend(); ++it) {
+            DWORD old;
+            VirtualProtect(it->addr, 2, PAGE_EXECUTE_READWRITE, &old);
+            *it->addr = it->old_value;
+            VirtualProtect(it->addr, 2, old, &old);
+        }
         engine_byte_patches.clear();
+        engine_word_patches.clear();
+        if (workaround_patched) {
+            apply_workaround_nop(false);
+            workaround_patched = false;
+        }
     }
 
-    // Camo-safe engine level: disable expensive flags only.
-    // Skips original OFF_00=1, OFF_01=1, OFF_04=0, OFF_18/1B/23/6C=0 and workaround NOP.
     static void apply_engine_level(int level) noexcept {
         restore_engine_patches();
         if (level <= 0) return;
         if (!resolve_engine_potato()) return;
 
-        // low+
-        engine_write_byte(OFF_0E, 0);
-        engine_write_byte(OFF_14, 0);
-        engine_write_byte(OFF_16, 0);
+        auto apply_common_tail = [&]() {
+            engine_write_byte(OFF_6C, 0);
+            engine_write_byte(OFF_1B, 0);
+            engine_write_byte(OFF_18, 0);
+            engine_write_byte(OFF_23, 0);
+            // Medium uses 2 here and camo still works; original high/ultra used 0
+            engine_write_word(OFF_04, 2);
+            engine_write_byte(OFF_0E, 0);
+            engine_write_byte(OFF_14, 0);
+            engine_write_byte(OFF_16, 0);
+        };
 
-        if (level >= 3) {
-            engine_write_byte(OFF_09, 0);
-            engine_write_byte(OFF_11, 0);
-            engine_write_byte(OFF_17, 0);
-        }
         if (level >= 4) {
             engine_write_byte(OFF_10, 0);
+            engine_write_byte(OFF_09, 0);
+            // SKIP OFF_01 = 1  (breaks camo)
+            engine_write_byte(OFF_11, 0);
+            engine_write_byte(OFF_17, 0);
+            // SKIP OFF_00 = 1  (breaks camo)
+            apply_workaround_nop(true);
+            apply_common_tail();
+        } else if (level >= 3) {
+            engine_write_byte(OFF_09, 0);
+            // SKIP OFF_01 = 1
+            engine_write_byte(OFF_11, 0);
+            engine_write_byte(OFF_17, 0);
+            // SKIP OFF_00 = 1
+            apply_workaround_nop(true);
+            apply_common_tail();
+        } else if (level >= 2) {
+            apply_workaround_nop(true);
+            apply_common_tail();
+        } else {
+            engine_write_byte(OFF_0E, 0);
+            engine_write_byte(OFF_14, 0);
+            engine_write_byte(OFF_16, 0);
         }
     }
 
@@ -247,7 +326,7 @@ namespace {
                     break;
                 }
                 case HaloCE::TAG_CLASS_INT_SHADER_MODEL:
-                    // KEEP multipurpose map – Active Camo depends on it
+                    // Do NOT null multipurpose – Active Camo uses it
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SOSO_DETAIL_MAP_OFFSET);
                     patch_float(tag.data, SOSO_PERP_BRIGHTNESS_OFFSET, 0.0f);
@@ -279,7 +358,6 @@ namespace {
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_CHICAGO_EXTENDED:
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_PLASMA:
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_GENERIC:
-                    // Active Camo / shields – never touch
                     break;
                 default:
                     break;
@@ -408,7 +486,7 @@ static ChimeraCommandError potato_impl(size_t argc, const char **argv) noexcept 
     }
 
     char current[128] = {};
-    sprintf(current, "%s (%d) | engine=%s | camo=SAFE | corpses=%s",
+    sprintf(current, "%s (%d) | engine=%s | camo=safe | corpses=%s",
             level_name(active_level), active_level,
             engine_potato_found ? "potato_sig OK" : "sig MISSING",
             corpse_cleanup_enabled ? "instant" : "normal");
