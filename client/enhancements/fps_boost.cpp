@@ -21,23 +21,20 @@
 #include "../visuals/anisotropic_filtering.h"
 
 // =============================================================================
-// Original Chimera potato (2018) – reverse engineered from Kavawuvi DLL
+// Chimera Potato – engine patch (original 2018) + camo-safe limits
 // =============================================================================
-// potato_sig finds:  66 39 1D XX XX XX XX 75 47 38 1D ...
-//   = cmp word [GLOBAL], bx / jnz ...
-// GLOBAL is a rasterizer feature flag structure in Halo CE 1.10.
-//
-// Per-level the original writes specific bytes/words into GLOBAL+offsets and
-// NOPs potato_workaround_sig (6 bytes of 0x90) on medium+.
-// That is what produces the ~200 FPS jump – not tag stripping alone.
-//
-// Camo: we still never touch chicago/plasma tags.
+// Original ultra sets rasterizer flags that make Active Camo fully invisible.
+// We keep the FPS-oriented disables but NEVER:
+//   - set OFF_00 / OFF_01 (opaque-only style flags in original ultra)
+//   - zero OFF_04 word aggressively on high/ultra
+//   - NOP potato_workaround (can break transparent paths)
+//   - null shader_model multipurpose maps (Active Camo uses them)
+//   - touch chicago / plasma / generic transparent shaders
 // =============================================================================
 
 namespace {
     constexpr uint32_t NULL_TAG_ID = 0xFFFFFFFFu;
 
-    // ---- Original potato_sig pattern (27 shorts) ----
     const short POTATO_SIG[] = {
         0x66, 0x39, 0x1D, -1, -1, -1, -1, 0x75,
         0x47, 0x38, 0x1D, -1, -1, -1, -1, 0x74,
@@ -45,17 +42,6 @@ namespace {
         0xE5, 0x00, 0x00
     };
 
-    // potato_workaround_sig (17 shorts) – NOP'd on medium+
-    const short POTATO_WORKAROUND_SIG[] = {
-        0x0F, 0x8F, 0xAF, 0x00, 0x00, 0x00, 0x40, 0x66,
-        0x3B, 0xC3, 0x7C, 0xE4, 0xE9, 0xBF, 0x00, 0x00,
-        0x00
-    };
-
-    // Offsets into rasterizer flag structure (from original handler)
-    constexpr size_t OFF_00 = 0x00;
-    constexpr size_t OFF_01 = 0x01;
-    constexpr size_t OFF_04 = 0x04; // word
     constexpr size_t OFF_09 = 0x09;
     constexpr size_t OFF_0E = 0x0E;
     constexpr size_t OFF_10 = 0x10;
@@ -63,12 +49,7 @@ namespace {
     constexpr size_t OFF_14 = 0x14;
     constexpr size_t OFF_16 = 0x16;
     constexpr size_t OFF_17 = 0x17;
-    constexpr size_t OFF_18 = 0x18;
-    constexpr size_t OFF_1B = 0x1B;
-    constexpr size_t OFF_23 = 0x23;
-    constexpr size_t OFF_6C = 0x6C;
 
-    // Tag-side (secondary, keeps models visible / camo safe)
     constexpr size_t SHADER_DETAIL_LEVEL_OFFSET = 0x02;
     constexpr size_t SENV_FLAGS_OFFSET            = 0x28;
     constexpr size_t SENV_BASE_MAP_OFFSET         = 0x88;
@@ -80,7 +61,6 @@ namespace {
     constexpr size_t SENV_PERP_BRIGHTNESS_OFFSET  = 0x318;
     constexpr size_t SENV_PARA_BRIGHTNESS_OFFSET  = 0x31C;
     constexpr size_t SENV_REFLECTION_CUBE_OFFSET  = 0x340;
-    constexpr size_t SOSO_MULTIPURPOSE_MAP_OFFSET = 0xCC;
     constexpr size_t SOSO_DETAIL_MAP_OFFSET       = 0xEC;
     constexpr size_t SOSO_PERP_BRIGHTNESS_OFFSET  = 0x18C;
     constexpr size_t SOSO_PARA_BRIGHTNESS_OFFSET  = 0x19C;
@@ -102,25 +82,19 @@ namespace {
     struct U16Patch { uint16_t *value; uint16_t old_value; };
     struct FloatPatch { float *value; float old_value; };
     struct BytePatch { uint8_t *addr; uint8_t old_value; };
-    struct WordPatch { uint16_t *addr; uint16_t old_value; };
-    struct CodePatch { uint8_t *addr; uint8_t old_bytes[6]; };
 
     std::vector<DependencyPatch> dependency_patches;
     std::vector<U16Patch> u16_patches;
     std::vector<FloatPatch> float_patches;
     std::vector<BytePatch> engine_byte_patches;
-    std::vector<WordPatch> engine_word_patches;
-    CodePatch workaround_patch = {};
-    bool workaround_patched = false;
 
     bool optional_zoom_blur = false;
     bool optional_multitexture_overlay = false;
     int active_level = 0;
     bool corpse_cleanup_enabled = false;
     bool engine_potato_found = false;
-    uint8_t *rasterizer_flags = nullptr; // GLOBAL from potato_sig
+    uint8_t *rasterizer_flags = nullptr;
 
-    // ---- signature scan in Halo module ----
     static void *scan_module(const short *pattern, size_t pattern_len) noexcept {
         HMODULE halo = GetModuleHandleA(nullptr);
         if (!halo) return nullptr;
@@ -155,7 +129,6 @@ namespace {
             rasterizer_flags = nullptr;
             return false;
         }
-        // Pattern: 66 39 1D XX XX XX XX 75  → dword at +3 is GLOBAL
         rasterizer_flags = *reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(match) + 3);
         engine_potato_found = rasterizer_flags != nullptr;
         return engine_potato_found;
@@ -171,35 +144,6 @@ namespace {
         VirtualProtect(p, 1, old, &old);
     }
 
-    static void engine_write_word(size_t offset, uint16_t value) noexcept {
-        if (!rasterizer_flags) return;
-        auto *p = reinterpret_cast<uint16_t *>(rasterizer_flags + offset);
-        engine_word_patches.push_back({p, *p});
-        DWORD old;
-        VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old);
-        *p = value;
-        VirtualProtect(p, 2, old, &old);
-    }
-
-    static void apply_workaround_nop(bool enable) noexcept {
-        void *match = scan_module(POTATO_WORKAROUND_SIG, sizeof(POTATO_WORKAROUND_SIG) / sizeof(POTATO_WORKAROUND_SIG[0]));
-        if (!match) return;
-        auto *p = static_cast<uint8_t *>(match);
-        DWORD old;
-        VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old);
-        if (enable) {
-            if (!workaround_patched) {
-                memcpy(workaround_patch.old_bytes, p, 6);
-                workaround_patch.addr = p;
-                workaround_patched = true;
-            }
-            memset(p, 0x90, 6);
-        } else if (workaround_patched && workaround_patch.addr == p) {
-            memcpy(p, workaround_patch.old_bytes, 6);
-        }
-        VirtualProtect(p, 6, old, &old);
-    }
-
     static void restore_engine_patches() noexcept {
         for (auto it = engine_byte_patches.rbegin(); it != engine_byte_patches.rend(); ++it) {
             DWORD old;
@@ -207,73 +151,31 @@ namespace {
             *it->addr = it->old_value;
             VirtualProtect(it->addr, 1, old, &old);
         }
-        for (auto it = engine_word_patches.rbegin(); it != engine_word_patches.rend(); ++it) {
-            DWORD old;
-            VirtualProtect(it->addr, 2, PAGE_EXECUTE_READWRITE, &old);
-            *it->addr = it->old_value;
-            VirtualProtect(it->addr, 2, old, &old);
-        }
         engine_byte_patches.clear();
-        engine_word_patches.clear();
-        if (workaround_patched) {
-            apply_workaround_nop(false);
-            workaround_patched = false;
-        }
     }
 
-    // Exact per-level writes from original handler jump table
+    // Camo-safe engine level: disable expensive flags only.
+    // Skips original OFF_00=1, OFF_01=1, OFF_04=0, OFF_18/1B/23/6C=0 and workaround NOP.
     static void apply_engine_level(int level) noexcept {
         restore_engine_patches();
         if (level <= 0) return;
         if (!resolve_engine_potato()) return;
 
-        // Shared tail used by low/medium/high/ultra (from original)
-        auto apply_common_tail = [&]() {
-            engine_write_byte(OFF_6C, 0);
-            engine_write_byte(OFF_1B, 0);
-            engine_write_byte(OFF_18, 0);
-            engine_write_byte(OFF_23, 0);
-            if (level == 2)
-                engine_write_word(OFF_04, 2);
-            engine_write_byte(OFF_0E, 0);
-            engine_write_byte(OFF_14, 0);
-            engine_write_byte(OFF_16, 0);
-        };
+        // low+
+        engine_write_byte(OFF_0E, 0);
+        engine_write_byte(OFF_14, 0);
+        engine_write_byte(OFF_16, 0);
 
+        if (level >= 3) {
+            engine_write_byte(OFF_09, 0);
+            engine_write_byte(OFF_11, 0);
+            engine_write_byte(OFF_17, 0);
+        }
         if (level >= 4) {
-            // ultra – full potato
             engine_write_byte(OFF_10, 0);
-            engine_write_byte(OFF_09, 0);
-            engine_write_byte(OFF_01, 1);
-            engine_write_byte(OFF_11, 0);
-            engine_write_byte(OFF_17, 0);
-            engine_write_word(OFF_04, 0);
-            engine_write_byte(OFF_00, 1);
-            apply_workaround_nop(true);
-            apply_common_tail();
-        } else if (level >= 3) {
-            // high
-            engine_write_byte(OFF_09, 0);
-            engine_write_byte(OFF_01, 1);
-            engine_write_byte(OFF_11, 0);
-            engine_write_byte(OFF_17, 0);
-            engine_write_word(OFF_04, 0);
-            engine_write_byte(OFF_00, 1);
-            apply_workaround_nop(true);
-            apply_common_tail();
-        } else if (level >= 2) {
-            // medium
-            apply_workaround_nop(true);
-            apply_common_tail();
-        } else {
-            // low
-            engine_write_byte(OFF_0E, 0);
-            engine_write_byte(OFF_14, 0);
-            engine_write_byte(OFF_16, 0);
         }
     }
 
-    // ---- Tag profile (secondary, camo-safe) ----
     void patch_dependency(char *tag_data, size_t offset) noexcept {
         auto *datum = reinterpret_cast<uint32_t *>(tag_data + offset + 12);
         if (*datum == NULL_TAG_ID) return;
@@ -345,9 +247,9 @@ namespace {
                     break;
                 }
                 case HaloCE::TAG_CLASS_INT_SHADER_MODEL:
+                    // KEEP multipurpose map – Active Camo depends on it
                     patch_detail_level(tag.data);
                     patch_dependency(tag.data, SOSO_DETAIL_MAP_OFFSET);
-                    patch_dependency(tag.data, SOSO_MULTIPURPOSE_MAP_OFFSET);
                     patch_float(tag.data, SOSO_PERP_BRIGHTNESS_OFFSET, 0.0f);
                     patch_float(tag.data, SOSO_PARA_BRIGHTNESS_OFFSET, 0.0f);
                     patch_dependency(tag.data, SOSO_REFLECTION_CUBE_OFFSET);
@@ -377,6 +279,7 @@ namespace {
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_CHICAGO_EXTENDED:
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_PLASMA:
                 case HaloCE::TAG_CLASS_INT_SHADER_TRANSPARENT_GENERIC:
+                    // Active Camo / shields – never touch
                     break;
                 default:
                     break;
@@ -411,7 +314,6 @@ namespace {
         dependency_patches.clear();
         u16_patches.clear();
         float_patches.clear();
-        // Engine flags persist across maps; re-apply tag profile only
         apply_tag_profile(active_level);
     }
 
@@ -506,13 +408,11 @@ static ChimeraCommandError potato_impl(size_t argc, const char **argv) noexcept 
     }
 
     char current[128] = {};
-    sprintf(current, "%s (%d) | engine=%s | camo=safe | corpses=%s",
+    sprintf(current, "%s (%d) | engine=%s | camo=SAFE | corpses=%s",
             level_name(active_level), active_level,
             engine_potato_found ? "potato_sig OK" : "sig MISSING",
             corpse_cleanup_enabled ? "instant" : "normal");
     console_out(current);
-    if (!engine_potato_found)
-        console_out_warning("potato_sig not found – engine rasterizer patch inactive (tag-only mode)");
     return CHIMERA_COMMAND_ERROR_SUCCESS;
 }
 
